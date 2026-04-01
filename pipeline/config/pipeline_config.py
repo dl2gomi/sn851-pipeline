@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass
@@ -41,6 +41,35 @@ class ServeConfig:
 
 
 @dataclass
+class PostgresConfig:
+    """External PostgreSQL process; pipeline connects via DSN only."""
+
+    enabled: bool = False
+    dsn: str = ""
+
+
+@dataclass
+class PrometheusConfig:
+    """In-process /metrics HTTP for Grafana scrape targets."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 9100
+
+
+@dataclass
+class CheckpointConfig:
+    """Full HF-style weight export on gated best steps (local disk only)."""
+
+    enabled: bool = True
+    subdir: str = "checkpoints"
+    keep_last_n: int = 3
+    atomic: bool = True
+    safe_serialization: bool = True
+    max_shard_size: str = "10GB"
+
+
+@dataclass
 class PipelineConfig:
     system_config_url: str = (
         "https://raw.githubusercontent.com/AffineFoundation/affine-cortex/"
@@ -61,8 +90,12 @@ class PipelineConfig:
     export_every_n_steps: int = 5
     artifacts_dir: Path = Path("artifacts")
     model_dir: Path = Path("model")
+    run_id: Optional[str] = None
     train_scoring_envs_only: bool = True
     training: TrainingConfig = field(default_factory=TrainingConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     serve: ServeConfig = field(default_factory=ServeConfig)
+    postgres: PostgresConfig = field(default_factory=PostgresConfig)
+    prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)

@@ -1,4 +1,5 @@
 pipeline:
+  # run_id: "optional-fixed-id"  # omit for a new UUID per process; overridden by CLI --run-id
   system_config_url: "https://raw.githubusercontent.com/AffineFoundation/affine-cortex/refs/heads/main/affine/database/system_config.json"
   model_dir: "model"
   artifacts_dir: "artifacts"
@@ -38,6 +39,20 @@ pipeline:
     host: "127.0.0.1"
     port: 8000
     api_key: "local-dev"
+  postgres:
+    enabled: false
+    dsn: "postgresql://user:pass@localhost:5432/sn851"
+  prometheus:
+    enabled: false
+    host: "127.0.0.1"
+    port: 9100
+  checkpoint:
+    enabled: true
+    subdir: "checkpoints"
+    keep_last_n: 3
+    atomic: true
+    safe_serialization: true
+    max_shard_size: "10GB"
 
 cli:
   run:

@@ -1,6 +1,17 @@
-from typing import List
+import asyncio
+import subprocess
+import uuid
+from datetime import datetime, timezone
+from typing import List, Optional
 
-from ..config import PipelineConfig
+from ..config import PipelineConfig, pipeline_config_snapshot
+from ..core.scoring.evaluator import Evaluator
+from ..core.scoring.exporter import ExportResult, Exporter
+from ..core.scoring.reward import RewardService
+from ..core.execution.rollout import RolloutWorker
+from ..core.sampling.sampler import TaskSampler
+from ..core.state.replay_buffer import ReplayBuffer
+from ..core.training.trainer import Trainer
 from ..integration.affine_config import load_env_configs, split_active_envs
 from ..integration.backends import (
     AffineEnvironmentExecutor,
@@ -9,19 +20,34 @@ from ..integration.backends import (
     SharedModelRuntime,
 )
 from ..integration.model_guard import validate_local_config
-from ..core.scoring.evaluator import Evaluator
-from ..core.scoring.exporter import Exporter
-from ..core.scoring.reward import RewardService
-from ..core.execution.rollout import RolloutWorker
-from ..core.sampling.sampler import TaskSampler
-from ..core.state.replay_buffer import ReplayBuffer
-from ..core.training.trainer import Trainer
+from ..observability import build_metrics_recorder
+from ..observability.protocols import MetricsRecorderPort
+from ..persistence import build_run_persistence
+from ..persistence.protocols import CheckpointRecord, RunPersistencePort, StepRecord
 from ..schemas import EvalMetrics, TrainMetrics, Trajectory
+
+
+def _git_head() -> Optional[str]:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            text=True,
+        )
+        return out.strip() or None
+    except Exception:
+        return None
 
 
 class PipelineOrchestrator:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
+        if not (cfg.run_id and str(cfg.run_id).strip()):
+            cfg.run_id = str(uuid.uuid4())
+        else:
+            cfg.run_id = str(cfg.run_id).strip()
+        self.run_id = cfg.run_id
         self.env_configs = load_env_configs(
             system_config_url=cfg.system_config_url,
         )
@@ -68,7 +94,10 @@ class PipelineOrchestrator:
         self.exporter = Exporter(
             artifacts_dir=cfg.artifacts_dir,
             env_regression_tolerance=cfg.scoring.env_regression_tolerance,
+            checkpoint_cfg=cfg.checkpoint,
         )
+        self.persistence: RunPersistencePort = build_run_persistence(cfg)
+        self.metrics: MetricsRecorderPort = build_metrics_recorder(cfg)
 
     def run(self, steps: int, dry_run: bool = True) -> None:
         config_path = self.cfg.model_dir / "config.json"
@@ -87,7 +116,7 @@ class PipelineOrchestrator:
                     raise ValueError(reason)
 
         print(
-            f"Starting pipeline: steps={steps}, dry_run={dry_run}, "
+            f"Starting pipeline: run_id={self.run_id}, steps={steps}, dry_run={dry_run}, "
             f"system_config_url={self.cfg.system_config_url}"
         )
         if dry_run:
@@ -96,22 +125,92 @@ class PipelineOrchestrator:
                 "and environment executor to run training."
             )
             return
-        self.runtime.ensure_server_started()
+
+        self.metrics.start()
+        self.persistence.begin_run(
+            self.run_id,
+            config_snapshot=pipeline_config_snapshot(self.cfg),
+            model_dir=self.cfg.model_dir,
+            artifacts_dir=self.cfg.artifacts_dir,
+            git_commit=_git_head(),
+        )
+
+        run_ok = False
         try:
+            self.runtime.ensure_server_started()
             for step in range(1, steps + 1):
+                t0 = datetime.now(timezone.utc)
                 trajectories = self._collect_rollouts()
                 self.replay.add_many(trajectories)
                 train_metrics = self._train_step(step)
                 eval_metrics = self._eval_step(step)
-                exported = self._maybe_export(step, eval_metrics, train_metrics.loss)
-                self._log_step(train_metrics, eval_metrics, exported)
+                export_result = self._maybe_export(step, eval_metrics, train_metrics.loss)
+                t1 = datetime.now(timezone.utc)
+                self._persist_step(
+                    train_metrics=train_metrics,
+                    eval_metrics=eval_metrics,
+                    export_result=export_result,
+                    started_at=t0,
+                    ended_at=t1,
+                )
+                self._log_step(train_metrics, eval_metrics, export_result.exported)
+            run_ok = True
         finally:
-            # Best-effort resource cleanup.
             close = getattr(self.rollout.executor, "close", None)
             if callable(close):
-                import asyncio
                 asyncio.run(close())
             self.runtime.stop_server()
+            self.persistence.finish_run(self.run_id, "completed" if run_ok else "failed")
+
+    def _persist_step(
+        self,
+        *,
+        train_metrics: TrainMetrics,
+        eval_metrics: EvalMetrics,
+        export_result: ExportResult,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> None:
+        self.metrics.record_step(self.run_id, train_metrics, eval_metrics)
+        wu = self.runtime.weights_updated_at
+        self.metrics.record_weights_timestamp(self.run_id, wu)
+        wdt = datetime.fromtimestamp(wu, tz=timezone.utc) if wu is not None else None
+
+        self.persistence.record_step(
+            StepRecord(
+                run_id=self.run_id,
+                step=train_metrics.step,
+                started_at=started_at,
+                ended_at=ended_at,
+                train_loss=train_metrics.loss,
+                avg_reward=train_metrics.avg_reward,
+                avg_kl=train_metrics.avg_kl,
+                geometric_mean=eval_metrics.geometric_mean,
+                eligible_for_scoring=eval_metrics.eligible_for_scoring,
+                env_scores=dict(eval_metrics.env_scores),
+                env_completeness=dict(eval_metrics.env_completeness),
+                exported_checkpoint=export_result.checkpoint_path is not None,
+                weights_updated_at=wdt,
+            )
+        )
+
+        if export_result.checkpoint_path is not None:
+            from ..core.scoring.checkpoint_fs import directory_size_bytes, list_weight_artifacts
+            p = export_result.checkpoint_path
+            self.persistence.record_checkpoint(
+                CheckpointRecord(
+                    run_id=self.run_id,
+                    step=eval_metrics.step,
+                    storage_path=p,
+                    geometric_mean=eval_metrics.geometric_mean,
+                    env_scores=dict(eval_metrics.env_scores),
+                    weights_updated_at=wdt,  # same runtime snapshot as step row
+                    manifest_version=1,
+                    bytes_total=directory_size_bytes(p),
+                    shard_files=list_weight_artifacts(p),
+                )
+            )
+            self.metrics.record_checkpoint_exported(self.run_id)
 
     def _collect_rollouts(self) -> List[Trajectory]:
         tasks = self.sampler.sample(self.cfg.training.rollout_batch_size)
@@ -126,13 +225,17 @@ class PipelineOrchestrator:
         window = self.replay.latest(self.cfg.eval_window_size)
         return self.evaluator.evaluate(step, window, self.replay.completed_task_ids())
 
-    def _maybe_export(self, step: int, eval_metrics: EvalMetrics, train_loss: float) -> bool:
+    def _maybe_export(self, step: int, eval_metrics: EvalMetrics, train_loss: float) -> ExportResult:
         if step % self.cfg.export_every_n_steps != 0:
-            return False
-        return self.exporter.export_if_best(eval_metrics, train_step_loss=train_loss)
+            return ExportResult(False)
+        return self.exporter.export_if_best(
+            eval_metrics,
+            train_step_loss=train_loss,
+            run_id=self.run_id,
+            runtime=self.runtime,
+        )
 
-    @staticmethod
-    def _log_step(train_metrics: TrainMetrics, eval_metrics: EvalMetrics, exported: bool) -> None:
+    def _log_step(self, train_metrics: TrainMetrics, eval_metrics: EvalMetrics, exported: bool) -> None:
         env_view = ", ".join(
             f"{env}:{score:.3f}" for env, score in sorted(eval_metrics.env_scores.items())
         )
@@ -140,7 +243,7 @@ class PipelineOrchestrator:
             f"{env}:{c:.2%}" for env, c in sorted(eval_metrics.env_completeness.items())
         )
         print(
-            f"[step={train_metrics.step}] "
+            f"[run_id={self.run_id} step={train_metrics.step}] "
             f"loss={train_metrics.loss:.4f} "
             f"avg_reward={train_metrics.avg_reward:.4f} "
             f"avg_kl={train_metrics.avg_kl:.4f} "

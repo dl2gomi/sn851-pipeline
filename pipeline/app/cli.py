@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--batch-size", type=int, default=None)
     run.add_argument("--model-dir", type=Path, default=None, help="Local model folder containing config.json")
     run.add_argument("--train-all-sampling-envs", action="store_true")
+    run.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Stable id for this training run (Postgres/Prometheus); default: random UUID",
+    )
 
     pull = sub.add_parser("pull-model", help="Pull top model via af CLI")
     pull.add_argument("uid", type=int, help="Miner UID to pull model from")
@@ -65,6 +71,8 @@ def run_cli() -> None:
         cfg.training.mini_batch_size = args.batch_size
     if args.model_dir is not None:
         cfg.model_dir = args.model_dir
+    if args.run_id is not None:
+        cfg.run_id = args.run_id.strip() or None
     cfg.train_scoring_envs_only = not args.train_all_sampling_envs
     orch = PipelineOrchestrator(cfg)
     steps = args.steps if args.steps is not None else app_cfg.cli.run.steps

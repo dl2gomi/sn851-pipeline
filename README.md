@@ -37,6 +37,9 @@ Key RL knobs in `configuration.yaml`:
 Environment config knob:
 - `pipeline.system_config_url`: URL of Affine `system_config.json` used by the pipeline
 - `pipeline.serve.host|port|api_key`: in-process OpenAI-compatible server for env-side inference callbacks
+- `pipeline.postgres.enabled|dsn`: optional external PostgreSQL for run/step/checkpoint registry
+- `pipeline.prometheus.enabled|host|port`: optional in-process `/metrics` for Grafana scrape targets
+- `pipeline.checkpoint.*`: full HF-style weight export (subdir, retention, atomic writes) — see `docs/checkpointing-and-observability.md`
 
 ## Layout
 
@@ -59,7 +62,11 @@ Environment config knob:
 - `pipeline/core/state/replay_buffer.py` - in-memory replay buffer
 - `pipeline/core/training/trainer.py` - training controller using a real backend adapter
 - `pipeline/core/scoring/evaluator.py` - geometric-mean and completeness evaluator
-- `pipeline/core/scoring/exporter.py` - gated checkpoint exporter (best GM + no hard regression)
+- `pipeline/core/scoring/exporter.py` - gated export (metrics JSON + optional full model tree)
+- `pipeline/core/scoring/checkpoint_fs.py` - atomic checkpoint dirs, prune, `index.jsonl`
+- `pipeline/persistence/` - Postgres registry (`protocols`, `factory`, `postgres/repository`, `noop`)
+- `pipeline/observability/` - Prometheus metrics (`factory`, `prometheus/recorder`, `noop`)
+- `pipeline/config/snapshot.py` - JSON-safe pipeline config snapshot for DB rows
 - `pipeline/app/orchestrator.py` - end-to-end control loop
 - `pipeline/app/cli.py` - CLI argument parsing and run wiring
 - `pipeline/main.py` - CLI entrypoint
@@ -97,6 +104,8 @@ python -m pipeline.main --steps 10 --dry-run
 - `--train-all-sampling-envs` (flag)
   - If set, train on all `enabled_for_sampling` environments.
   - If not set, train only on `enabled_for_scoring` environments.
+- `--run-id` (string, optional)
+  - Stable identifier for this process (checkpoint registry, Postgres, Prometheus). If omitted, a random UUID is assigned and stored on `PipelineConfig.run_id`.
 - `--config` (path, global)
   - Path to central `configuration.yaml`.
   - Default is `configuration.yaml` in project root.
@@ -166,6 +175,8 @@ This runs `af pull 42 --model-path model` under the hood.
 
 ## Checkpoint export (full model write — planned)
 
+**Production plan (PostgreSQL registry + Prometheus + Grafana + full weight dirs):** see [`docs/checkpointing-and-observability.md`](docs/checkpointing-and-observability.md).
+
 **Current behavior:** `Exporter.export_if_best` only writes a small JSON manifest under `artifacts_dir` when gates pass. **Full weight files are not written yet.**
 
 **Adopted strategy (for implementation):** **full Hugging Face–style directory** per successful export — `model.save_pretrained` + `tokenizer.save_pretrained` into a dedicated folder (multi-shard `safetensors` as HF does for large models). **No automatic Hugging Face Hub upload**; you upload the saved folder yourself after training.
@@ -195,7 +206,7 @@ This runs `af pull 42 --model-path model` under the hood.
 3. Env execution: affinetes + `env_images.json` is wired; revisit the checklist in **Environment integration (re-check later)** when the stack changes.
 4. Keep RL updates in `train_step()` without server restarts/reloads.
 5. Implement full-model checkpoint export per **Checkpoint export (full model write — planned)**; Hub upload remains manual.
-6. Persist replay and metrics to your experiment tracker.
+6. Wire Postgres, Prometheus/Grafana, and checkpoint export per [`docs/checkpointing-and-observability.md`](docs/checkpointing-and-observability.md).
 
 Non-dry runs print per-step logs with:
 - per-env scores

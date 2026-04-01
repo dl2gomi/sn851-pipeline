@@ -1,4 +1,12 @@
-from .pipeline_config import PipelineConfig, SamplingConfig, ScoringConfig, TrainingConfig
+from .pipeline_config import (
+    CheckpointConfig,
+    PipelineConfig,
+    PostgresConfig,
+    PrometheusConfig,
+    SamplingConfig,
+    ScoringConfig,
+    TrainingConfig,
+)
 from .loader import (
     AppConfig,
     CliConfig,
@@ -6,15 +14,20 @@ from .loader import (
     RunCommandConfig,
     load_app_config,
 )
+from .snapshot import pipeline_config_snapshot
 
 __all__ = [
     "PipelineConfig",
     "TrainingConfig",
     "ScoringConfig",
     "SamplingConfig",
+    "PostgresConfig",
+    "PrometheusConfig",
+    "CheckpointConfig",
     "RunCommandConfig",
     "PullModelCommandConfig",
     "CliConfig",
     "AppConfig",
     "load_app_config",
+    "pipeline_config_snapshot",
 ]

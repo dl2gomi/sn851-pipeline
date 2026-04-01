@@ -108,6 +108,44 @@ class SharedModelRuntime:
     def base_url(self) -> str:
         return f"http://{self.serve_host}:{self.serve_port}/v1"
 
+    @property
+    def weights_updated_at(self) -> float | None:
+        return self._weights_updated_at
+
+    def save_hf_checkpoint(
+        self,
+        output_dir: Path,
+        *,
+        safe_serialization: bool = True,
+        max_shard_size: str = "10GB",
+    ) -> dict[str, Any]:
+        """Write model + tokenizer to a directory (under model lock). Returns manifest fields."""
+        self._lazy_init()
+        output_dir = Path(output_dir)
+        meta: dict[str, Any] = {
+            "source_model_dir": str(self.model_dir.resolve()),
+            "weights_updated_at": self._weights_updated_at,
+            "weights_updated_at_iso": None,
+        }
+        if self._weights_updated_at is not None:
+            meta["weights_updated_at_iso"] = datetime.fromtimestamp(
+                self._weights_updated_at, tz=timezone.utc
+            ).isoformat()
+
+        with self._model_lock:
+            was_training = self._model.training
+            self._model.eval()
+            try:
+                self._model.save_pretrained(
+                    output_dir,
+                    safe_serialization=safe_serialization,
+                    max_shard_size=max_shard_size,
+                )
+                self._tokenizer.save_pretrained(output_dir)
+            finally:
+                self._model.train(was_training)
+        return meta
+
     def ensure_server_started(self) -> None:
         if self._server_thread and self._server_thread.is_alive():
             return

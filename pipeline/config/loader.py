@@ -44,6 +44,8 @@ def load_app_config(path: Path) -> AppConfig:
     cfg.export_every_n_steps = int(pipeline_raw.get("export_every_n_steps", cfg.export_every_n_steps))
     cfg.artifacts_dir = Path(pipeline_raw.get("artifacts_dir", str(cfg.artifacts_dir)))
     cfg.model_dir = Path(pipeline_raw.get("model_dir", str(cfg.model_dir)))
+    if pipeline_raw.get("run_id") is not None:
+        cfg.run_id = str(pipeline_raw["run_id"]).strip() or None
     cfg.train_scoring_envs_only = bool(
         pipeline_raw.get("train_scoring_envs_only", cfg.train_scoring_envs_only)
     )
@@ -99,6 +101,23 @@ def load_app_config(path: Path) -> AppConfig:
     cfg.serve.host = str(serve_raw.get("host", cfg.serve.host))
     cfg.serve.port = int(serve_raw.get("port", cfg.serve.port))
     cfg.serve.api_key = str(serve_raw.get("api_key", cfg.serve.api_key))
+
+    pg_raw: Dict[str, Any] = pipeline_raw.get("postgres", {})
+    cfg.postgres.enabled = bool(pg_raw.get("enabled", cfg.postgres.enabled))
+    cfg.postgres.dsn = str(pg_raw.get("dsn", cfg.postgres.dsn))
+
+    prom_raw: Dict[str, Any] = pipeline_raw.get("prometheus", {})
+    cfg.prometheus.enabled = bool(prom_raw.get("enabled", cfg.prometheus.enabled))
+    cfg.prometheus.host = str(prom_raw.get("host", cfg.prometheus.host))
+    cfg.prometheus.port = int(prom_raw.get("port", cfg.prometheus.port))
+
+    ck_raw: Dict[str, Any] = pipeline_raw.get("checkpoint", {})
+    cfg.checkpoint.enabled = bool(ck_raw.get("enabled", cfg.checkpoint.enabled))
+    cfg.checkpoint.subdir = str(ck_raw.get("subdir", cfg.checkpoint.subdir))
+    cfg.checkpoint.keep_last_n = int(ck_raw.get("keep_last_n", cfg.checkpoint.keep_last_n))
+    cfg.checkpoint.atomic = bool(ck_raw.get("atomic", cfg.checkpoint.atomic))
+    cfg.checkpoint.safe_serialization = bool(ck_raw.get("safe_serialization", cfg.checkpoint.safe_serialization))
+    cfg.checkpoint.max_shard_size = str(ck_raw.get("max_shard_size", cfg.checkpoint.max_shard_size))
 
     run_raw = cli_raw.get("run", {})
     pull_raw = cli_raw.get("pull_model", {})

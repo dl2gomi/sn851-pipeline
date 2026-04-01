@@ -1,0 +1,6 @@
+pyyaml
+torch
+transformers
+fastapi
+uvicorn
+affinetes

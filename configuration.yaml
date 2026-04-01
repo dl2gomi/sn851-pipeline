@@ -1,0 +1,47 @@
+pipeline:
+  system_config_url: "https://raw.githubusercontent.com/AffineFoundation/affine-cortex/refs/heads/main/affine/database/system_config.json"
+  model_dir: "model"
+  artifacts_dir: "artifacts"
+  train_scoring_envs_only: true
+  rollouts_per_step: 16
+  replay_capacity: 4000
+  eval_window_size: 256
+  max_steps: 20
+  export_every_n_steps: 5
+  env_sampling_weights:
+    GAME: 1.0
+    NAVWORLD: 1.0
+    LIVEWEB: 1.0
+    SWE-INFINITE: 1.0
+  training:
+    algorithm: "ppo"
+    lr: 1.0e-5
+    rollout_batch_size: 256
+    mini_batch_size: 8
+    gradient_accumulation_steps: 32
+    ppo_epochs: 2
+    clip_range: 0.2
+    target_kl: 0.03
+    kl_coef: 0.02
+    max_grad_norm: 1.0
+    use_value_head: true
+    value_loss_coef: 0.5
+  scoring:
+    geometric_mean_epsilon: 0.1
+    env_regression_tolerance: 0.01
+  sampling:
+    enable_rate_limit: true
+    rate_margin: 1.2
+    min_completion_hours: 48
+    rate_window_seconds: 3600
+  serve:
+    host: "127.0.0.1"
+    port: 8000
+    api_key: "local-dev"
+
+cli:
+  run:
+    steps: 5
+    dry_run: false
+  pull_model:
+    model_dir: "model"

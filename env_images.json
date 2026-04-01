@@ -1,0 +1,17 @@
+{
+  "PRINT": "affinefoundation/cde:print",
+  "LGC-v2": "affinefoundation/lgc:pi-v2",
+  "GAME": "affinefoundation/game:openspiel",
+  "SWE-SYNTH": "affinefoundation/swe-synth:latest",
+  "SWE-INFINITE": "affinefoundation/swe_infinite_images:latest",
+  "LIVEWEB": "affinefoundation/liveweb-arena:latest",
+  "LGC": "affinefoundation/lgc:pi-v2",
+  "CDE": "affinefoundation/cde:pi",
+  "SWE-PRO": "affinefoundation/swebench:pro",
+  "DED-V2": "affinefoundation/affine-env:v4",
+  "ABD-V2": "affinefoundation/affine-env:v4",
+  "ARC-GEN": "affinefoundation/arc:latest",
+  "NAVWORLD": "affinefoundation/navworld:latest",
+  "LOGPROBS": "affinefoundation/logprobs:latest",
+  "MEMORY": "affinefoundation/affine-env:v4"
+}

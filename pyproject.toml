@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sn851-pipeline"
+version = "0.1.0"
+description = "SN851 RL pipeline scaffold aligned to Affine mechanisms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyyaml", "torch", "transformers", "fastapi", "uvicorn", "affinetes"]
+
+[tool.setuptools]
+packages = ["pipeline"]

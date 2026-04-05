@@ -19,6 +19,10 @@ class Trajectory:
     is_timeout: bool = False
     is_format_valid: bool = True
     reward: float = 0.0
+    # PPO: sum of log-prob(token|prefix) over completion tokens under the behavior policy at rollout.
+    rollout_logprob_sum: float = 0.0
+    # Value head: V(prompt) at rollout (Monte Carlo target is reward for single-turn LM).
+    rollout_value: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

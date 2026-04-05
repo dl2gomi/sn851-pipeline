@@ -10,4 +10,9 @@ class AffinePolicyAdapter(Policy):
         self.runtime = runtime
 
     def generate(self, task: Task) -> str:
-        return self.runtime.generate(task)
+        text, _, _ = self.runtime.rollout_forward(task)
+        return text
+
+    def rollout_forward(self, task: Task) -> tuple[str, float, float]:
+        """(response text, completion log-prob sum, value estimate at prompt)."""
+        return self.runtime.rollout_forward(task)

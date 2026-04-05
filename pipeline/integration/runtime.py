@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import random
 import threading
 import time
 import uuid
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
@@ -42,6 +44,7 @@ class SharedModelRuntime:
         self._tokenizer: Any = None
         self._model: Any = None
         self._reference_model: Any = None
+        self._value_head: Any = None
         self._optimizer: Any = None
         self._torch: Any = None
         self._weights_updated_at: float | None = None
@@ -85,20 +88,271 @@ class SharedModelRuntime:
         for p in self._reference_model.parameters():
             p.requires_grad = False
 
-        self._optimizer = torch.optim.AdamW(
-            self._model.parameters(),
-            lr=float(self.training_defaults.lr),
-        )
+        hidden = int(getattr(self._model.config, "hidden_size", 0) or 0)
+        if self.training_defaults.use_value_head:
+            if hidden <= 0:
+                raise ValueError("use_value_head requires model.config.hidden_size")
+            self._value_head = torch.nn.Linear(hidden, 1, dtype=torch.float32).to(device)
+        else:
+            self._value_head = None
+
+        opt_params = list(self._model.parameters())
+        if self._value_head is not None:
+            opt_params += list(self._value_head.parameters())
+        self._optimizer = torch.optim.AdamW(opt_params, lr=float(self.training_defaults.lr))
 
         self._weights_updated_at = time.time()
 
     def generate(self, task: Task) -> str:
         return self.generate_from_prompt(task.prompt or "")
 
+    def rollout_forward(self, task: Task) -> tuple[str, float, float]:
+        """Sample completion + off-policy stats for PPO (under model lock)."""
+        self._lazy_init()
+        prompt = task.prompt or ""
+        with self._model_lock:
+            text = self._generate_unlocked(prompt)
+            fake = Trajectory(task=task, response=text, raw_score=0.0, reward=0.0)
+            item = self._encode_trajectory(fake)
+            with self._torch.no_grad():
+                lp_t = self._response_log_prob_sum(
+                    item["input_ids"], item["labels"], use_reference=False
+                )
+                lp = float(lp_t.item())
+                if self._value_head is not None:
+                    v = float(self._value_at_prompt(prompt, requires_grad=False).item())
+                else:
+                    v = 0.0
+        return text, lp, v
+
     def generate_from_prompt(self, prompt: str) -> str:
         self._lazy_init()
         with self._model_lock:
-            return self._generate_unlocked(prompt=prompt)
+            return self._generate_unlocked(prompt)
+
+    def _build_prompt_from_messages(self, messages: Any) -> str:
+        """Turn OpenAI-style chat messages into a single model prompt (chat template when available)."""
+        if not isinstance(messages, list) or not messages:
+            return ""
+        normalized: list[dict[str, str]] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role", "user"))
+            content = m.get("content")
+            if content is None:
+                continue
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(str(block.get("text", "")))
+                content = "".join(parts) if parts else str(content)
+            else:
+                content = str(content)
+            normalized.append({"role": role, "content": content})
+        if not normalized:
+            return ""
+        tok = self._tokenizer
+        if getattr(tok, "chat_template", None) is not None and hasattr(tok, "apply_chat_template"):
+            try:
+                return tok.apply_chat_template(
+                    normalized,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+        lines = [f"{m['role'].upper()}: {m['content']}" for m in normalized]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_stop(stop: Any) -> list[str] | None:
+        if stop is None:
+            return None
+        if isinstance(stop, str):
+            return [stop] if stop else None
+        try:
+            out = [str(s) for s in stop if s]
+        except TypeError:
+            return None
+        return out or None
+
+    @staticmethod
+    def _apply_stop_strings(text: str, stops: list[str] | None) -> tuple[str, bool]:
+        if not stops or not text:
+            return text, False
+        earliest = len(text)
+        for s in stops:
+            if not s:
+                continue
+            i = text.find(s)
+            if i != -1 and i < earliest:
+                earliest = i
+        if earliest >= len(text):
+            return text, False
+        return text[:earliest], True
+
+    def _generate_unlocked(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
+        seed: int | None = None,
+    ) -> str:
+        text, _, _, _ = self._generate_unlocked_with_meta(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            seed=seed,
+        )
+        return text
+
+    def _generate_unlocked_with_meta(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
+        seed: int | None = None,
+    ) -> tuple[str, int, int, str]:
+        """Returns (text, prompt_tokens, completion_tokens, finish_reason)."""
+        torch = self._torch
+        if seed is not None:
+            torch.manual_seed(int(seed))
+        mnt = int(max_new_tokens) if max_new_tokens is not None else self.max_new_tokens
+        mnt = max(1, min(mnt, 1_000_000))
+        temp = float(self.temperature if temperature is None else temperature)
+        tp = float(self.top_p if top_p is None else top_p)
+        do_sample = temp is not None and temp > 1e-6
+
+        model_inputs = self._tokenizer(prompt, return_tensors="pt")
+        model_inputs = {k: v.to(self._model.device) for k, v in model_inputs.items()}
+        prompt_len = int(model_inputs["input_ids"].shape[1])
+
+        gen_kw: dict[str, Any] = {
+            **model_inputs,
+            "max_new_tokens": mnt,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.pad_token_id,
+            "eos_token_id": self._tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_kw["temperature"] = max(temp, 1e-6)
+            gen_kw["top_p"] = tp
+
+        with torch.no_grad():
+            out = self._model.generate(**gen_kw)
+        new_tokens = int(out.shape[1]) - prompt_len
+        raw_ids = out[0, prompt_len:]
+        text = self._tokenizer.decode(raw_ids, skip_special_tokens=True)
+        text, hit_stop = self._apply_stop_strings(text, stop)
+
+        comp_tokens = len(self._tokenizer.encode(text, add_special_tokens=False)) if text else 0
+        eos_id = self._tokenizer.eos_token_id
+        natural_eos = (
+            eos_id is not None
+            and raw_ids.numel() > 0
+            and int(raw_ids[-1].item()) == int(eos_id)
+        )
+
+        if hit_stop or natural_eos:
+            finish = "stop"
+        elif new_tokens >= mnt:
+            finish = "length"
+        else:
+            finish = "stop"
+
+        return text, prompt_len, comp_tokens, finish
+
+    def _stream_chat_unlocked(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
+        seed: int | None = None,
+    ) -> Any:
+        """Yields (delta_text, is_final, usage_dict|None, finish_reason|None)."""
+        try:
+            from transformers import TextIteratorStreamer
+        except ImportError:
+            text, pt, ct, fr = self._generate_unlocked_with_meta(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                seed=seed,
+            )
+            if text:
+                yield text, False, None, None
+            yield "", True, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}, fr
+            return
+
+        torch = self._torch
+        if seed is not None:
+            torch.manual_seed(int(seed))
+        mnt = int(max_new_tokens) if max_new_tokens is not None else self.max_new_tokens
+        mnt = max(1, min(mnt, 1_000_000))
+        temp = float(self.temperature if temperature is None else temperature)
+        tp = float(self.top_p if top_p is None else top_p)
+        do_sample = temp is not None and temp > 1e-6
+
+        model_inputs = self._tokenizer(prompt, return_tensors="pt")
+        model_inputs = {k: v.to(self._model.device) for k, v in model_inputs.items()}
+        prompt_len = int(model_inputs["input_ids"].shape[1])
+
+        streamer = TextIteratorStreamer(self._tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kw: dict[str, Any] = {
+            **model_inputs,
+            "max_new_tokens": mnt,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.pad_token_id,
+            "eos_token_id": self._tokenizer.eos_token_id,
+            "streamer": streamer,
+        }
+        if do_sample:
+            gen_kw["temperature"] = max(temp, 1e-6)
+            gen_kw["top_p"] = tp
+
+        def _worker() -> None:
+            with torch.no_grad():
+                self._model.generate(**gen_kw)
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+
+        emitted = 0
+        full = ""
+        for new_text in streamer:
+            full += new_text
+            display, hit = self._apply_stop_strings(full, stop)
+            if len(display) > emitted:
+                yield display[emitted:], False, None, None
+                emitted = len(display)
+            if hit:
+                pt = prompt_len
+                ct = len(self._tokenizer.encode(display, add_special_tokens=False))
+                yield "", True, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}, "stop"
+                worker.join(timeout=600)
+                return
+        worker.join(timeout=600)
+        display, hit_stop = self._apply_stop_strings(full, stop)
+        if len(display) > emitted:
+            yield display[emitted:], False, None, None
+        ct = len(self._tokenizer.encode(display, add_special_tokens=False))
+        pt = prompt_len
+        yield "", True, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}, "stop"
 
     @property
     def model_name(self) -> str:
@@ -166,44 +420,113 @@ class SharedModelRuntime:
         if not batch:
             return 0.0
 
+        algo = (training.algorithm or "ppo").lower()
+        if algo != "ppo" and not getattr(self, "_non_ppo_warned", False):
+            warnings.warn(
+                f"training.algorithm={training.algorithm!r} is not fully supported; using PPO clipped objective.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._non_ppo_warned = True
+
+        device = self._model.device
+        rewards = torch.tensor([float(t.reward) for t in batch], device=device, dtype=torch.float32)
+
+        use_v = bool(training.use_value_head) and self._value_head is not None
+        if use_v:
+            rv = torch.tensor([float(t.rollout_value) for t in batch], device=device, dtype=torch.float32)
+            advantages = rewards - rv.detach()
+        else:
+            advantages = rewards - rewards.mean()
+
+        adv_std = advantages.std()
+        if adv_std > 1e-8:
+            advantages = advantages / (adv_std + 1e-8)
+
+        encoded = [self._encode_trajectory(t) for t in batch]
+        old_logps: list[Any] = []
+        with torch.no_grad():
+            for t, item in zip(batch, encoded):
+                if abs(float(t.rollout_logprob_sum)) > 1e-12:
+                    old_logps.append(
+                        torch.tensor(float(t.rollout_logprob_sum), device=device, dtype=torch.float32)
+                    )
+                else:
+                    old_logps.append(
+                        self._response_log_prob_sum(
+                            item["input_ids"], item["labels"], use_reference=False
+                        ).float()
+                    )
+
         with self._model_lock:
             grad_accum = max(1, int(training.gradient_accumulation_steps))
             ppo_epochs = max(1, int(training.ppo_epochs))
             kl_coef = float(training.kl_coef)
             max_grad_norm = float(training.max_grad_norm)
+            clip_eps = float(training.clip_range)
+            target_kl = float(training.target_kl)
+            value_loss_coef = float(training.value_loss_coef)
 
-            rewards = torch.tensor([float(t.reward) for t in batch], device=self._model.device)
-            reward_baseline = rewards.mean()
-            advantages = rewards - reward_baseline
-
-            encoded = [self._encode_trajectory(t) for t in batch]
             total_loss = 0.0
             updates = 0
             self._optimizer.zero_grad(set_to_none=True)
 
-            for _ in range(ppo_epochs):
-                for i, item in enumerate(encoded):
+            param_list = list(self._model.parameters())
+            if self._value_head is not None:
+                param_list += list(self._value_head.parameters())
+
+            for _epoch in range(ppo_epochs):
+                epoch_kls: list[float] = []
+                order = list(range(len(encoded)))
+                random.shuffle(order)
+                for step_i, i in enumerate(order, start=1):
+                    item = encoded[i]
+                    new_lp = self._response_log_prob_sum(
+                        item["input_ids"], item["labels"], use_reference=False
+                    )
+                    old_lp = old_logps[i].to(device=new_lp.device, dtype=new_lp.dtype)
+                    ratio = torch.exp(new_lp - old_lp).squeeze()
+                    adv = advantages[i].to(dtype=ratio.dtype)
+                    unclipped = ratio * adv
+                    clipped_r = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+                    policy_loss = -torch.min(unclipped, clipped_r)
+
                     nll_cur = self._response_nll(item["input_ids"], item["labels"], use_reference=False)
                     with torch.no_grad():
                         nll_ref = self._response_nll(item["input_ids"], item["labels"], use_reference=True)
-
-                    adv = advantages[i].detach()
-                    policy_loss = adv * nll_cur
                     kl_loss = (nll_cur - nll_ref) ** 2
-                    loss = policy_loss + (kl_coef * kl_loss)
+
+                    loss = policy_loss + kl_coef * kl_loss
+                    if use_v:
+                        v_pred = self._value_at_prompt(batch[i].task.prompt or "", requires_grad=True)
+                        if v_pred.dim() > 0:
+                            v_pred = v_pred.squeeze()
+                        value_loss = (v_pred - rewards[i]) ** 2
+                        loss = loss + value_loss_coef * value_loss
+
+                    approx_kl = float((old_lp - new_lp.detach()).reshape(-1)[0].item())
+                    epoch_kls.append(approx_kl)
+
                     (loss / grad_accum).backward()
-                    total_loss += float(loss.detach().item())
+                    total_loss += float(loss.detach().reshape(-1)[0].item())
                     updates += 1
 
-                    if ((i + 1) % grad_accum) == 0 or (i + 1) == len(encoded):
-                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_grad_norm)
+                    if (step_i % grad_accum) == 0 or step_i == len(encoded):
+                        torch.nn.utils.clip_grad_norm_(param_list, max_grad_norm)
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
+
+                if target_kl > 0.0 and epoch_kls:
+                    mean_kl = sum(epoch_kls) / len(epoch_kls)
+                    if mean_kl > target_kl:
+                        break
 
             avg_loss = total_loss / max(updates, 1)
 
             with torch.no_grad():
-                for ref_param, cur_param in zip(self._reference_model.parameters(), self._model.parameters()):
+                for ref_param, cur_param in zip(
+                    self._reference_model.parameters(), self._model.parameters()
+                ):
                     ref_param.data.mul_(0.99).add_(cur_param.data, alpha=0.01)
             self._weights_updated_at = time.time()
             return float(avg_loss)
@@ -235,22 +558,27 @@ class SharedModelRuntime:
         out = model(input_ids=input_ids, labels=labels)
         return out.loss
 
-    def _generate_unlocked(self, prompt: str) -> str:
+    def _response_log_prob_sum(self, input_ids: Any, labels: Any, *, use_reference: bool) -> Any:
+        model = self._reference_model if use_reference else self._model
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out.loss
+        mask = (labels != -100).to(dtype=loss.dtype)
+        n = mask.sum().clamp(min=1)
+        return -loss * n
+
+    def _value_at_prompt(self, prompt: str, *, requires_grad: bool) -> Any:
         torch = self._torch
-        model_inputs = self._tokenizer(prompt, return_tensors="pt")
-        model_inputs = {k: v.to(self._model.device) for k, v in model_inputs.items()}
-        with torch.no_grad():
-            out = self._model.generate(
-                **model_inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                pad_token_id=self._tokenizer.pad_token_id,
-                eos_token_id=self._tokenizer.eos_token_id,
-            )
-        completion_ids = out[0][model_inputs["input_ids"].shape[1] :]
-        return self._tokenizer.decode(completion_ids, skip_special_tokens=True)
+        if self._value_head is None:
+            z = torch.zeros((), device=self._model.device, dtype=torch.float32)
+            return z if requires_grad else z.detach()
+        enc = self._tokenizer(prompt, return_tensors="pt")
+        enc = {k: v.to(self._model.device) for k, v in enc.items()}
+        ctx = torch.enable_grad() if requires_grad else torch.no_grad()
+        with ctx:
+            out = self._model(**enc, output_hidden_states=True)
+            h = out.hidden_states[-1][:, -1, :].float()
+            v = self._value_head(h).squeeze(-1).squeeze(0)
+        return v
 
     def _start_server(self) -> None:
         try:
@@ -292,33 +620,55 @@ class SharedModelRuntime:
         @app.post("/v1/chat/completions")
         async def chat_completions(payload: dict[str, Any], authorization: str | None = Header(default=None)) -> Any:
             _check_auth(authorization)
+            runtime._lazy_init()
+            try:
+                n_val = int(payload.get("n", 1))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid n.")
+            if n_val != 1:
+                raise HTTPException(status_code=400, detail="Only n=1 is supported.")
+
             messages = payload.get("messages", [])
             stream = bool(payload.get("stream", False))
-            prompt = "\n".join(
-                str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("content")
-            )
-            text = runtime.generate_from_prompt(prompt)
-
+            max_tokens = payload.get("max_tokens")
+            max_new_tokens = int(max_tokens) if max_tokens is not None else None
+            temp_raw = payload.get("temperature")
+            temperature_f = float(temp_raw) if temp_raw is not None else None
+            top_p_raw = payload.get("top_p")
+            top_p_f = float(top_p_raw) if top_p_raw is not None else None
+            seed_raw = payload.get("seed")
+            seed_i = int(seed_raw) if seed_raw is not None else None
+            stops = runtime._normalize_stop(payload.get("stop"))
+            model_id = str(payload.get("model", runtime.model_name))
             req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
             created = int(time.time())
-            usage = {
-                "prompt_tokens": 0,
-                "completion_tokens": len(text.split()),
-                "total_tokens": len(text.split()),
-            }
+
+            def _sync_complete() -> tuple[str, int, int, str]:
+                with runtime._model_lock:
+                    prompt = runtime._build_prompt_from_messages(messages)
+                    return runtime._generate_unlocked_with_meta(
+                        prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature_f,
+                        top_p=top_p_f,
+                        stop=stops,
+                        seed=seed_i,
+                    )
 
             if not stream:
+                text, pt, ct, fr = await asyncio.to_thread(_sync_complete)
+                usage = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
                 return JSONResponse(
                     {
                         "id": req_id,
                         "object": "chat.completion",
                         "created": created,
-                        "model": payload.get("model", runtime.model_name),
+                        "model": model_id,
                         "choices": [
                             {
                                 "index": 0,
                                 "message": {"role": "assistant", "content": text},
-                                "finish_reason": "stop",
+                                "finish_reason": fr,
                             }
                         ],
                         "usage": usage,
@@ -326,35 +676,58 @@ class SharedModelRuntime:
                 )
 
             def event_stream() -> Generator[str, None, None]:
-                chunks = text.split() if text else [""]
+                runtime._lazy_init()
                 header = {
                     "id": req_id,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": payload.get("model", runtime.model_name),
+                    "model": model_id,
                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(header)}\n\n"
-                for idx, token in enumerate(chunks):
-                    delta = token if idx == len(chunks) - 1 else f"{token} "
-                    item = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": payload.get("model", runtime.model_name),
-                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(item)}\n\n"
-                tail = {
-                    "id": req_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": payload.get("model", runtime.model_name),
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": usage,
-                }
-                yield f"data: {json.dumps(tail)}\n\n"
-                yield "data: [DONE]\n\n"
+                with runtime._model_lock:
+                    prompt = runtime._build_prompt_from_messages(messages)
+                    for delta, is_final, usage, fr_reason in runtime._stream_chat_unlocked(
+                        prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature_f,
+                        top_p=top_p_f,
+                        stop=stops,
+                        seed=seed_i,
+                    ):
+                        if is_final:
+                            tail = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": fr_reason or "stop",
+                                    }
+                                ],
+                                "usage": usage,
+                            }
+                            yield f"data: {json.dumps(tail)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        if delta:
+                            item = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": delta},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(item)}\n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 

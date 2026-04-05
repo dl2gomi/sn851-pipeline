@@ -8,6 +8,7 @@ class TrainingConfig:
     algorithm: str = "ppo"
     lr: float = 1e-5
     rollout_batch_size: int = 16
+    # Not used for replay window selection; orchestrator trains on latest rollout_batch_size trajectories.
     mini_batch_size: int = 8
     gradient_accumulation_steps: int = 1
     ppo_epochs: int = 2

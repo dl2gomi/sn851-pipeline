@@ -30,7 +30,12 @@ class RolloutWorker:
     def rollout(self, tasks: List[Task]) -> List[Trajectory]:
         trajectories: List[Trajectory] = []
         for task in tasks:
-            response = self.policy.generate(task)
+            rollout_forward = getattr(self.policy, "rollout_forward", None)
+            if callable(rollout_forward):
+                response, lp_sum, val_est = rollout_forward(task)
+            else:
+                response = self.policy.generate(task)
+                lp_sum, val_est = 0.0, 0.0
             env_result = self.executor.evaluate(task, response)
             trajectories.append(
                 Trajectory(
@@ -40,6 +45,8 @@ class RolloutWorker:
                     kl_estimate=env_result.kl_estimate,
                     is_timeout=env_result.is_timeout,
                     is_format_valid=env_result.is_format_valid,
+                    rollout_logprob_sum=lp_sum,
+                    rollout_value=val_est,
                 )
             )
         return trajectories

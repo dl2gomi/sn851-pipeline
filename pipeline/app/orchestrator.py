@@ -82,7 +82,7 @@ class PipelineOrchestrator:
         self.replay = ReplayBuffer(capacity=cfg.replay_capacity)
         self.trainer = Trainer(
             lr=cfg.training.lr,
-            batch_size=cfg.training.mini_batch_size,
+            batch_size=cfg.training.rollout_batch_size,
             ppo_epochs=cfg.training.ppo_epochs,
             training_config=cfg.training,
             backend=AffineTrainerBackend(self.runtime),
@@ -218,7 +218,8 @@ class PipelineOrchestrator:
         return [self.reward.score_trajectory(t) for t in trajectories]
 
     def _train_step(self, step: int) -> TrainMetrics:
-        batch = self.replay.latest(self.cfg.training.mini_batch_size)
+        # PPO: train on the same on-policy window we just collected (FIFO tail), not mini_batch_size.
+        batch = self.replay.latest(self.cfg.training.rollout_batch_size)
         return self.trainer.update(step, batch)
 
     def _eval_step(self, step: int) -> EvalMetrics:

@@ -45,8 +45,12 @@ class RolloutWorker:
                     kl_estimate=env_result.kl_estimate,
                     is_timeout=env_result.is_timeout,
                     is_format_valid=env_result.is_format_valid,
+                    reward=env_result.score,
                     rollout_logprob_sum=lp_sum,
                     rollout_value=val_est,
+                    rewards=[env_result.score],
+                    values=[val_est],
+                    dones=[True],
                 )
             )
         return trajectories

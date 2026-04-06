@@ -23,6 +23,10 @@ class Trajectory:
     rollout_logprob_sum: float = 0.0
     # Value head: V(prompt) at rollout (Monte Carlo target is reward for single-turn LM).
     rollout_value: float = 0.0
+    # For GAE: sequences of rewards, values, dones
+    rewards: List[float] = field(default_factory=lambda: [])
+    values: List[float] = field(default_factory=lambda: [])
+    dones: List[bool] = field(default_factory=lambda: [])
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

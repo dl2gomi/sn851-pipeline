@@ -15,9 +15,19 @@ class TrainingConfig:
     clip_range: float = 0.2
     target_kl: float = 0.03
     kl_coef: float = 0.02
+    entropy_coef: float = 0.01
     max_grad_norm: float = 1.0
     use_value_head: bool = True
     value_loss_coef: float = 0.5
+    lr_scheduler: str = "constant"
+    lr_warmup_steps: int = 0
+    max_steps: int = 1000
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    temperature: float = 1.0
+    temperature_decay: float = 1.0
+    validation_every: int = 10
+    validation_batch_size: int = 16
 
 
 @dataclass

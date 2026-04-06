@@ -144,6 +144,9 @@ class PipelineOrchestrator:
                 self.replay.add_many(trajectories)
                 train_metrics = self._train_step(step)
                 eval_metrics = self._eval_step(step)
+                if step % self.cfg.training.validation_every == 0:
+                    validation_metrics = self._validation_step()
+                    print(f"[validation step={step}] avg_reward={validation_metrics.avg_reward:.4f}, avg_kl={validation_metrics.avg_kl:.4f}")
                 export_result = self._maybe_export(step, eval_metrics, train_metrics.loss)
                 t1 = datetime.now(timezone.utc)
                 self._persist_step(
@@ -225,6 +228,28 @@ class PipelineOrchestrator:
     def _eval_step(self, step: int) -> EvalMetrics:
         window = self.replay.latest(self.cfg.eval_window_size)
         return self.evaluator.evaluate(step, window, self.replay.completed_task_ids())
+
+    def _validation_step(self) -> TrainMetrics:
+        tasks = self.sampler.sample(self.cfg.training.validation_batch_size)
+        trajectories = self.rollout.rollout(tasks)
+        if not trajectories:
+            return TrainMetrics(
+                step=0,
+                loss=0.0,
+                avg_reward=0.0,
+                avg_raw_score=0.0,
+                avg_kl=0.0,
+            )
+        avg_reward = mean(t.reward for t in trajectories)
+        avg_raw = mean(t.raw_score for t in trajectories)
+        avg_kl = mean(t.kl_estimate for t in trajectories)
+        return TrainMetrics(
+            step=0,
+            loss=0.0,
+            avg_reward=avg_reward,
+            avg_raw_score=avg_raw,
+            avg_kl=avg_kl,
+        )
 
     def _maybe_export(self, step: int, eval_metrics: EvalMetrics, train_loss: float) -> ExportResult:
         if step % self.cfg.export_every_n_steps != 0:

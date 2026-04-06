@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import random
 import threading
 import time
@@ -35,7 +36,7 @@ class SharedModelRuntime:
         self.model_dir = Path(model_dir)
         self.training_defaults = training_defaults
         self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
+        self.temperature = float(self.training_defaults.temperature)
         self.top_p = top_p
         self.serve_host = serve_host
         self.serve_port = serve_port
@@ -83,6 +84,12 @@ class SharedModelRuntime:
         ).to(device)
         self._model.train()
 
+        # Load training state if exists
+        state_path = self.model_dir / 'training_state.pt'
+        if state_path.exists():
+            state = torch.load(state_path, map_location=device)
+            # Optimizer and scheduler will be loaded after they are created
+
         # Reference model for KL regularization anchor (frozen snapshot).
         self._reference_model = copy.deepcopy(self._model).eval()
         for p in self._reference_model.parameters():
@@ -100,6 +107,25 @@ class SharedModelRuntime:
         if self._value_head is not None:
             opt_params += list(self._value_head.parameters())
         self._optimizer = torch.optim.AdamW(opt_params, lr=float(self.training_defaults.lr))
+
+        if self.training_defaults.lr_scheduler == "cosine":
+            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self._optimizer, T_max=self.training_defaults.max_steps
+            )
+        else:
+            self._scheduler = None
+
+        self._kl_coef = float(self.training_defaults.kl_coef)
+        self._entropy_coef = float(self.training_defaults.entropy_coef)
+
+        if 'state' in locals() and state:
+            self._optimizer.load_state_dict(state['optimizer'])
+            if self._scheduler and 'scheduler' in state and state['scheduler']:
+                self._scheduler.load_state_dict(state['scheduler'])
+            self._kl_coef = state.get('kl_coef', self._kl_coef)
+            self._entropy_coef = state.get('entropy_coef', self._entropy_coef)
+            self.temperature = state.get('temperature', self.temperature)
+            self._weights_updated_at = state.get('weights_updated_at', self._weights_updated_at)
 
         self._weights_updated_at = time.time()
 
@@ -398,6 +424,15 @@ class SharedModelRuntime:
                 self._tokenizer.save_pretrained(output_dir)
             finally:
                 self._model.train(was_training)
+        # Save training state
+        torch.save({
+            'optimizer': self._optimizer.state_dict(),
+            'scheduler': self._scheduler.state_dict() if self._scheduler else None,
+            'kl_coef': self._kl_coef,
+            'entropy_coef': self._entropy_coef,
+            'temperature': self.temperature,
+            'weights_updated_at': self._weights_updated_at
+        }, output_dir / 'training_state.pt')
         return meta
 
     def ensure_server_started(self) -> None:
@@ -421,24 +456,41 @@ class SharedModelRuntime:
             return 0.0
 
         algo = (training.algorithm or "ppo").lower()
-        if algo != "ppo" and not getattr(self, "_non_ppo_warned", False):
+        if algo not in ("ppo", "a2c"):
             warnings.warn(
                 f"training.algorithm={training.algorithm!r} is not fully supported; using PPO clipped objective.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            self._non_ppo_warned = True
+            algo = "ppo"
 
         device = self._model.device
         rewards = torch.tensor([float(t.reward) for t in batch], device=device, dtype=torch.float32)
 
-        use_v = bool(training.use_value_head) and self._value_head is not None
-        if use_v:
-            rv = torch.tensor([float(t.rollout_value) for t in batch], device=device, dtype=torch.float32)
-            advantages = rewards - rv.detach()
-        else:
-            advantages = rewards - rewards.mean()
+        # Reward normalization for stability
+        reward_mean = rewards.mean()
+        reward_std = rewards.std() + 1e-8
+        normalized_rewards = (rewards - reward_mean) / reward_std
 
+        # Compute GAE advantages
+        gamma = float(training.gamma)
+        gae_lambda = float(training.gae_lambda)
+        advantages_list = []
+        returns_list = []
+        for traj in batch:
+            adv = 0.0
+            for t in reversed(range(len(traj.rewards))):
+                next_v = 0.0 if t == len(traj.rewards) - 1 or traj.dones[t] else traj.values[t + 1]
+                delta = traj.rewards[t] + gamma * next_v - traj.values[t]
+                adv = delta + gamma * gae_lambda * adv
+            advantages_list.append(adv)
+            # Compute return: advantage + baseline value
+            ret = adv + traj.values[0]
+            returns_list.append(ret)
+        advantages = torch.tensor(advantages_list, device=device, dtype=torch.float32)
+        returns = torch.tensor(returns_list, device=device, dtype=torch.float32)
+
+        # Normalize advantages
         adv_std = advantages.std()
         if adv_std > 1e-8:
             advantages = advantages / (adv_std + 1e-8)
@@ -461,7 +513,8 @@ class SharedModelRuntime:
         with self._model_lock:
             grad_accum = max(1, int(training.gradient_accumulation_steps))
             ppo_epochs = max(1, int(training.ppo_epochs))
-            kl_coef = float(training.kl_coef)
+            kl_coef = self._kl_coef
+            entropy_coef = self._entropy_coef
             max_grad_norm = float(training.max_grad_norm)
             clip_eps = float(training.clip_range)
             target_kl = float(training.target_kl)
@@ -479,39 +532,57 @@ class SharedModelRuntime:
                 epoch_kls: list[float] = []
                 order = list(range(len(encoded)))
                 random.shuffle(order)
-                for step_i, i in enumerate(order, start=1):
-                    item = encoded[i]
-                    new_lp = self._response_log_prob_sum(
-                        item["input_ids"], item["labels"], use_reference=False
-                    )
-                    old_lp = old_logps[i].to(device=new_lp.device, dtype=new_lp.dtype)
-                    ratio = torch.exp(new_lp - old_lp).squeeze()
-                    adv = advantages[i].to(dtype=ratio.dtype)
-                    unclipped = ratio * adv
-                    clipped_r = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-                    policy_loss = -torch.min(unclipped, clipped_r)
+                mini_batch_size = max(1, int(training.mini_batch_size))
+                for mini_start in range(0, len(order), mini_batch_size):
+                    mini_indices = order[mini_start:mini_start + mini_batch_size]
+                    mini_loss = 0.0
+                    mini_approx_kls = []
+                    for i in mini_indices:
+                        item = encoded[i]
+                        new_lp = self._response_log_prob_sum(
+                            item["input_ids"], item["labels"], use_reference=False
+                        )
+                        old_lp = old_logps[i].to(device=new_lp.device, dtype=new_lp.dtype)
+                        ratio = torch.exp(new_lp - old_lp).squeeze()
+                        adv = advantages[i].to(dtype=ratio.dtype)
+                        unclipped = ratio * adv
+                        if algo == "ppo":
+                            clipped_r = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+                            policy_loss = -torch.min(unclipped, clipped_r)
+                        else:  # a2c
+                            policy_loss = -unclipped
 
-                    nll_cur = self._response_nll(item["input_ids"], item["labels"], use_reference=False)
-                    with torch.no_grad():
-                        nll_ref = self._response_nll(item["input_ids"], item["labels"], use_reference=True)
-                    kl_loss = (nll_cur - nll_ref) ** 2
+                        nll_cur = self._response_nll(item["input_ids"], item["labels"], use_reference=False)
+                        with torch.no_grad():
+                            nll_ref = self._response_nll(item["input_ids"], item["labels"], use_reference=True)
+                        kl_loss = (nll_cur - nll_ref) ** 2
 
-                    loss = policy_loss + kl_coef * kl_loss
-                    if use_v:
-                        v_pred = self._value_at_prompt(batch[i].task.prompt or "", requires_grad=True)
-                        if v_pred.dim() > 0:
-                            v_pred = v_pred.squeeze()
-                        value_loss = (v_pred - rewards[i]) ** 2
-                        loss = loss + value_loss_coef * value_loss
+                        entropy = self._response_entropy(item["input_ids"], item["labels"], use_reference=False)
 
-                    approx_kl = float((old_lp - new_lp.detach()).reshape(-1)[0].item())
-                    epoch_kls.append(approx_kl)
+                        loss = policy_loss + kl_coef * kl_loss - entropy_coef * entropy
+                        if use_v:
+                            v_pred = self._value_at_prompt(batch[i].task.prompt or "", requires_grad=True)
+                            if v_pred.dim() > 0:
+                                v_pred = v_pred.squeeze()
+                            if algo == "ppo":
+                                old_v = batch[i].rollout_value
+                                v_clipped = torch.clamp(v_pred, old_v - clip_eps, old_v + clip_eps)
+                                value_loss = torch.max((v_pred - returns[i]) ** 2, (v_clipped - returns[i]) ** 2)
+                            else:  # a2c
+                                value_loss = (v_pred - returns[i]) ** 2
+                            loss = loss + value_loss_coef * value_loss
 
-                    (loss / grad_accum).backward()
-                    total_loss += float(loss.detach().reshape(-1)[0].item())
-                    updates += 1
+                        approx_kl = float((old_lp - new_lp.detach()).reshape(-1)[0].item())
+                        mini_approx_kls.append(approx_kl)
+                        mini_loss += loss
 
-                    if (step_i % grad_accum) == 0 or step_i == len(encoded):
+                    mini_loss /= len(mini_indices)
+                    (mini_loss / grad_accum).backward()
+                    total_loss += float(mini_loss.detach().reshape(-1)[0].item()) * len(mini_indices)
+                    updates += len(mini_indices)
+                    epoch_kls.extend(mini_approx_kls)
+
+                    if ((mini_start // mini_batch_size + 1) % grad_accum) == 0 or mini_start + mini_batch_size >= len(order):
                         torch.nn.utils.clip_grad_norm_(param_list, max_grad_norm)
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
@@ -521,7 +592,17 @@ class SharedModelRuntime:
                     if mean_kl > target_kl:
                         break
 
+            if epoch_kls:
+                mean_kl = sum(epoch_kls) / len(epoch_kls)
+                if mean_kl > target_kl * 1.5:
+                    self._kl_coef = min(self._kl_coef * 1.5, 1.0)
+                elif mean_kl < target_kl * 0.5:
+                    self._kl_coef = max(self._kl_coef * 0.5, 1e-5)
+                logging.info(f"Adaptive KL: mean_kl={mean_kl:.4f}, target_kl={target_kl:.4f}, new_kl_coef={self._kl_coef:.6f}")
+
             avg_loss = total_loss / max(updates, 1)
+
+            logging.info(f"Training step completed: avg_loss={avg_loss:.4f}, total_updates={updates}, final_kl_coef={self._kl_coef:.6f}")
 
             with torch.no_grad():
                 for ref_param, cur_param in zip(
@@ -529,6 +610,9 @@ class SharedModelRuntime:
                 ):
                     ref_param.data.mul_(0.99).add_(cur_param.data, alpha=0.01)
             self._weights_updated_at = time.time()
+            if self._scheduler:
+                self._scheduler.step()
+            self.temperature *= float(training.temperature_decay)
             return float(avg_loss)
 
     def _encode_trajectory(self, traj: Trajectory) -> dict[str, Any]:
@@ -565,6 +649,24 @@ class SharedModelRuntime:
         mask = (labels != -100).to(dtype=loss.dtype)
         n = mask.sum().clamp(min=1)
         return -loss * n
+
+    def _response_entropy(self, input_ids: Any, labels: Any, *, use_reference: bool) -> Any:
+        torch = self._torch
+        model = self._reference_model if use_reference else self._model
+        out = model(input_ids=input_ids, labels=None)
+        logits = out.logits  # (batch, seq_len, vocab)
+        mask = (labels != -100)  # (batch, seq_len)
+        # Shift for next token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_mask = mask[..., 1:].contiguous()
+        # Compute entropy per token
+        log_probs = torch.log_softmax(shift_logits, dim=-1)
+        probs = torch.softmax(shift_logits, dim=-1)
+        entropy_per_token = -torch.sum(probs * log_probs, dim=-1)  # (batch, seq_len-1)
+        # Sum over response tokens
+        entropy_sum = (entropy_per_token * shift_mask).sum(dim=-1)  # (batch,)
+        return entropy_sum
 
     def _value_at_prompt(self, prompt: str, *, requires_grad: bool) -> Any:
         torch = self._torch

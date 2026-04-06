@@ -58,5 +58,3 @@ cli:
   run:
     steps: 5
     dry_run: false
-  pull_model:
-    model_dir: "model"

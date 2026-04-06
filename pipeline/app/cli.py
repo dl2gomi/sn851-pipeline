@@ -1,6 +1,5 @@
 import argparse
 from pathlib import Path
-import subprocess
 import sys
 
 from ..config import load_app_config
@@ -16,7 +15,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("configuration.yaml"),
         help="Path to pipeline configuration.yaml",
     )
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Run pipeline orchestrator")
     run.add_argument("--steps", type=int, default=None, help="Number of orchestrator steps")
@@ -32,10 +31,6 @@ def parse_args() -> argparse.Namespace:
         help="Stable id for this training run (Postgres/Prometheus); default: random UUID",
     )
 
-    pull = sub.add_parser("pull-model", help="Pull top model via af CLI")
-    pull.add_argument("uid", type=int, help="Miner UID to pull model from")
-    pull.add_argument("--model-dir", type=Path, default=None, help="Output model directory (default: ./model)")
-
     return parser.parse_args()
 
 
@@ -43,7 +38,7 @@ def _ensure_backward_compatible_run_subcommand() -> None:
     if len(sys.argv) == 1:
         sys.argv.append("run")
         return
-    if any(arg in {"run", "pull-model"} for arg in sys.argv[1:]):
+    if "run" in sys.argv[1:]:
         return
     if sys.argv[1] == "--config":
         insert_pos = 3 if len(sys.argv) >= 3 else 2
@@ -56,13 +51,6 @@ def _ensure_backward_compatible_run_subcommand() -> None:
 def run_cli() -> None:
     args = parse_args()
     app_cfg = load_app_config(args.config)
-    if args.command == "pull-model":
-        model_dir = args.model_dir or app_cfg.cli.pull_model.model_dir
-        cmd = ["af", "pull", str(args.uid), "--model-path", str(model_dir)]
-        subprocess.run(cmd, check=True)
-        print(f"Pulled UID {args.uid} model to {model_dir}")
-        return
-
     cfg = app_cfg.pipeline
     if args.rollouts_per_step is not None:
         cfg.rollouts_per_step = args.rollouts_per_step

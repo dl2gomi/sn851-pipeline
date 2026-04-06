@@ -10,7 +10,6 @@ from .pipeline_config import (
 from .loader import (
     AppConfig,
     CliConfig,
-    PullModelCommandConfig,
     RunCommandConfig,
     load_app_config,
 )
@@ -25,7 +24,6 @@ __all__ = [
     "PrometheusConfig",
     "CheckpointConfig",
     "RunCommandConfig",
-    "PullModelCommandConfig",
     "CliConfig",
     "AppConfig",
     "load_app_config",

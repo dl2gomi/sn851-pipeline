@@ -110,14 +110,6 @@ python -m pipeline.main --steps 10 --dry-run
   - Path to central `configuration.yaml`.
   - Default is `configuration.yaml` in project root.
 
-### `pull-model`
-
-- `uid` (required)
-  - Miner UID to pull from using Affine CLI (`af pull`).
-- `--model-dir` (path, optional)
-  - Output directory for pulled model.
-  - Defaults to `model/` under this project.
-
 ## Runtime modes
 
 - `dry-run`:
@@ -148,9 +140,9 @@ Assumption today: envs in `env_images.json` match `system_config.json` names, Do
 
 **Later — per-env validation**: Add systematic checks beyond ad-hoc smoke tests: for each docker image / env name, document required `evaluate(...)` kwargs, timeouts, and LLM expectations; optional CI or a “preflight env matrix” that runs one short evaluation per env so regressions surface when images or affinetes change.
 
-## Train from top Affine model
+## Train from a local model directory
 
-1. Download/pull the full model snapshot (60+ GB is expected) and keep it anywhere on disk.
+1. Place a full model snapshot (60+ GB is typical for 32B-class weights) on disk by whatever workflow you use; this project does not invoke the Affine CLI (`af`) or any `aff` command.
 2. Start training loop with that path:
 ```bash
 python -m pipeline.main run --steps 100 --rollouts-per-step 64 --batch-size 32 --model-dir "D:\models\top-affine-model"
@@ -160,18 +152,15 @@ The pipeline enforces Affine-required Qwen3-32B-compatible architecture from `co
 By default, training focuses on `enabled_for_scoring` envs (Affine incentive path).
 Use `--train-all-sampling-envs` to include sampling-only environments.
 
-## Isolation mode (no local affine repo)
+## Environment metadata URL (default)
 
-The pipeline uses this URL by default:
+`pipeline.system_config_url` points at a **JSON document over HTTP** (no local Affine repo or CLI required). The default is Affine’s public `system_config.json` on GitHub:
+
 `https://raw.githubusercontent.com/AffineFoundation/affine-cortex/refs/heads/main/affine/database/system_config.json`
 
-## Optional model pull (separate subcommand)
+Override that URL in `configuration.yaml` if you host your own env registry.
 
-If you choose to pull through CLI:
-```bash
-python -m pipeline.main pull-model 42 --model-dir model
-```
-This runs `af pull 42 --model-path model` under the hood.
+**Python dependencies:** rollouts still use the **`affinetes`** package to run Docker-based envs (`env_images.json`). That is a normal pip dependency, not the `af` shell tool.
 
 ## Checkpoint export (full model write — planned)
 

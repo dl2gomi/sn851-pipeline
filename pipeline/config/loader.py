@@ -14,14 +14,8 @@ class RunCommandConfig:
 
 
 @dataclass
-class PullModelCommandConfig:
-    model_dir: Path = Path("model")
-
-
-@dataclass
 class CliConfig:
     run: RunCommandConfig = field(default_factory=RunCommandConfig)
-    pull_model: PullModelCommandConfig = field(default_factory=PullModelCommandConfig)
 
 
 @dataclass
@@ -120,14 +114,10 @@ def load_app_config(path: Path) -> AppConfig:
     cfg.checkpoint.max_shard_size = str(ck_raw.get("max_shard_size", cfg.checkpoint.max_shard_size))
 
     run_raw = cli_raw.get("run", {})
-    pull_raw = cli_raw.get("pull_model", {})
     cli_cfg = CliConfig(
         run=RunCommandConfig(
             steps=int(run_raw.get("steps", 5)),
             dry_run=bool(run_raw.get("dry_run", False)),
-        ),
-        pull_model=PullModelCommandConfig(
-            model_dir=Path(pull_raw.get("model_dir", str(cfg.model_dir)))
         ),
     )
     return AppConfig(pipeline=cfg, cli=cli_cfg)
